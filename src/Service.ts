@@ -91,7 +91,7 @@ export abstract class Service {
     }
 
     /**
-     * Starts the microservice.
+     * Runs the start sequence for the microservice.
      */
     public async startService(): Promise<void> {
         // Make sure the service is not already running
@@ -120,7 +120,7 @@ export abstract class Service {
     }
 
     /**
-     * Stops the microservice.
+     * Runs the stop sequence for the microservice.
      */
     public async stopService(): Promise<void> {
         // Make sure the service is running before stopping it
