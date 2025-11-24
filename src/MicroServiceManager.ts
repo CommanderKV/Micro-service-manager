@@ -393,7 +393,7 @@ export class MicroServiceManager {
         const child = fork(runnerPath, [runPath], {
             cwd: process.cwd(),
             env: process.env,
-            stdio: ["inherit", "pipe", "pipe", "ipc"]
+            stdio: ["pipe", "pipe", "pipe", "ipc"]
         });
 
         // Forward child's stdout/stderr to main process but prefix with service name and timestamp
