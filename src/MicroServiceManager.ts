@@ -252,14 +252,14 @@ export class MicroServiceManager {
         const base = path.split(/[\\\/]/).pop() || path;
         const key = base.replace(/\.js$|\.ts$/i, "");
         this.services.set(key, { path });
-        console.log(`\x1b[32m[${new Date().toISOString()}] [INFO] Service at ${path} registered as '${key}'.\x1b[0m`);
+        console.log(`\x1b[32m[${new Date().toISOString()}] [INFO] Service at ${path.slice(50)} registered as '${key}'.\x1b[0m`);
     }
 
     /**
      * Query the running service for status. Returns a promise that resolves with status payload
      * or rejects if service not found or not running.
      */
-    public getServiceStatus(name: string, timeoutMs = 2000): Promise<{ name: string; status: string; uptime: number; downtime: number; timeSinceLoad: number } | null> {
+    public getServiceStatus(name: string, timeoutMs: number = 2000): Promise<{ name: string; status: string; uptime: number; downtime: number; timeSinceLoad: number } | null> {
         return new Promise((resolve, reject) => {
             // Find entry by key, registeredName or by path basename
             const entryKey = this.findEntryKey(name);
@@ -315,25 +315,33 @@ export class MicroServiceManager {
      * @param name The name of the service to remove
      */
     public removeService(name: string): void {
-        // Check if the service is registered
-        if (!this.services.has(name)) {
+        // Find entry by key or registered name
+        const entryKey = this.findEntryKey(name);
+        if (!entryKey) {
             console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] Service with name ${name} is not registered.\x1b[0m`);
             return;
         }
 
-        const entry = this.services.get(name);
-        // If there's a running child process stop it then remove it
+        const entry = this.services.get(entryKey);
+        // If there's a running child process, request final shutdown then kill if it doesn't exit
         if (entry && entry.child) {
             try {
-                this.stopService(name);
-                entry.child.kill();
+                // Ask child to shutdown (will stop and then allow exit)
+                entry.child.send({ type: 'shutdown' });
+
+                // After grace period, kill if still alive
+                setTimeout(() => {
+                    try {
+                        entry.child && entry.child.kill();
+                    } catch (e) { }
+                }, this.defaultGracefulShutdownMs);
             } catch (e) {
-                console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] Failed to stop child process for service ${name}: ${e}\x1b[0m`);
+                try { entry.child.kill(); } catch (er) { }
             }
         }
 
         // Unregister the service
-        this.services.delete(name);
+        this.services.delete(entryKey);
         console.log(`\x1b[32m[${new Date().toISOString()}] [INFO] Service ${name} unregistered successfully.\x1b[0m`);
     }
 
@@ -349,9 +357,14 @@ export class MicroServiceManager {
         }
         const entry = this.services.get(entryKey)!;
 
-        // If already running in a child, ignore
+        // If already running in a child, ask the child to start the service (do not fork again)
         if (entry.child) {
-            console.warn(`\x1b[33m[${new Date().toISOString()}] [WARN] Service '${name}' already has a running child process.\x1b[0m`);
+            try {
+                entry.child.send({ type: 'start' });
+                entry.startedAt = Date.now();
+            } catch (e) {
+                console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] Failed to send start to existing child for service '${name}': ${e}\x1b[0m`);
+            }
             return;
         }
 
@@ -420,15 +433,16 @@ export class MicroServiceManager {
                 if (this.services.has(realName)) {
                     console.warn(`\x1b[33m[${new Date().toISOString()}] [WARN] Service name '${realName}' already exists; keeping original key.\x1b[0m`);
                 } else {
+                    console.log(`\x1b[32m[${new Date().toISOString()}] [INFO] Renaming service '${entryKey}' to '${realName}'\x1b[0m`);
                     // Re-key the map: copy entry to new key, delete old
                     this.services.set(realName, entry);
                     this.services.delete(entryKey);
                     entry.registeredName = realName;
-                    // Update local variable `name` for logging below
                 }
                 return;
             }
 
+            // Handle status response messages
             if (msg.type === "statusResponse") {
                 const id = msg.id;
                 const cb = this.pendingRequests.get(id);
@@ -437,6 +451,7 @@ export class MicroServiceManager {
             }
         });
 
+        // Listen for child exit events
         child.on("exit", (code, signal) => {
             if (code === null && signal === null) {
                 console.log(`\x1b[34m[${new Date().toISOString()}] [INFO] Service child exited normally.\x1b[0m`);
@@ -528,23 +543,22 @@ export class MicroServiceManager {
      * @returns A list of the service statuses
      */
     public listServicesInTable(): void {
-        // Make a table
-        const table = [];
-        for (const [name, entry] of this.services.entries()) {
-            // If service is running in a child process, reflect that status and compute uptime from startedAt
-            const status = entry.child ? "running" : "stopped";
-            const uptimeMs = entry.startedAt ? (Date.now() - entry.startedAt) : 0;
-            const downtimeMs = entry.startedAt ? 0 : 0; // downtime not tracked for child-run services here
-            const timeSinceLoadMs = 0; // manager no longer has load timestamps per-service
-            table.push({ 
-                name: entry.registeredName ?? name, 
-                status: status, 
-                uptime: this.formatDuration(uptimeMs), 
-                downtime: this.formatDuration(downtimeMs), 
-                timeSinceLoad: this.formatDuration(timeSinceLoadMs)
-            });
-        }
-        console.table(table);
+        Promise.resolve().then(async () => {
+            // Make a table
+            const table = [];
+            for (const [name, entry] of this.services.entries()) {
+                // If service is running in a child process, reflect that status and compute uptime from startedAt
+                const serviceData = await this.getServiceStatus(name);
+                table.push({ 
+                    name: entry.registeredName ?? name, 
+                    status: serviceData?.status, 
+                    uptime: this.formatDuration(serviceData?.uptime ?? 0), 
+                    downtime: this.formatDuration(serviceData?.downtime ?? 0), 
+                    timeSinceLoad: this.formatDuration(serviceData?.timeSinceLoad ?? 0)
+                });
+            }
+            console.table(table);
+        });
     }
 
     /**
