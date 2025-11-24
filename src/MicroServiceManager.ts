@@ -5,7 +5,7 @@ import path from "path";
 import { pathToFileURL } from "url";
 
 export class MicroServiceManager {
-    private services: Map<string, Service> = new Map();
+    private services: Map<string, [Service, string]> = new Map();
     private servicesDirectory: string;
 
     constructor(servicesDirectory: string) {
@@ -107,18 +107,8 @@ export class MicroServiceManager {
                             break;
                         }
 
-                        // Make a table
-                        const table = [];
-                        for (const [name, service] of this.services.entries()) {
-                            table.push({ 
-                                name: name, 
-                                status: service.status, 
-                                uptime: this.formatDuration(service.getTotalUptime()), 
-                                downtime: this.formatDuration(service.getDowntime()), 
-                                timeSinceLoad: this.formatDuration(service.getTotalTime())
-                            });
-                        }
-                        console.table(table);
+                        // List services in a table
+                        this.listServicesInTable();
                         break;
 
                     // Load a service or services from a given path
@@ -242,7 +232,7 @@ export class MicroServiceManager {
         import(filePath).then((module) => {
             // Create an instance of the service
             const serviceInstance: Service = new module.default();
-            this.addService(serviceInstance);
+            this.addService(serviceInstance, filePath);
         }).catch((error) => {
             console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] Failed to load service from ${filePath}: ${error}\x1b[0m`);
         });
@@ -252,18 +242,18 @@ export class MicroServiceManager {
      * Add a new microservice to the manager.
      * @param service The service to add
      */
-    public addService(service: Service): void | Error {
+    public addService(service: Service, path: string): void | Error {
         // Get the service name
         const name = service.name;
 
         // Check if the service is already registered
         if (this.services.has(name)) {
             console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] Service with name ${name} is already registered.\x1b[0m`);
-            throw new Error(`Service with name ${name} is already registered.`);
+            return;
         }
 
         // Register the service
-        this.services.set(name, service);
+        this.services.set(name, [service, path]);
         console.log(`\x1b[32m[${new Date().toISOString()}] [INFO] Service ${name} registered successfully.\x1b[0m`);
     }
 
@@ -278,7 +268,7 @@ export class MicroServiceManager {
             console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] Service '${name}' is not registered.\x1b[0m`);
             return undefined;
         }
-        return service;
+        return service[0];
     }
 
     /**
@@ -310,15 +300,15 @@ export class MicroServiceManager {
         }
 
         // Start the service
-        service.startService();
+        service[0].startService();
     }
 
     /**
      * Starts all registered services.
      */
     public startAllServices(): void {
-        for (const service of this.services.values()) {
-            service.startService();
+        for (const name of this.services.keys()) {
+            this.startService(name);
         }
     }
 
@@ -335,15 +325,15 @@ export class MicroServiceManager {
         }
 
         // Stop the service
-        service.stopService();
+        service[0].stopService();
     }
 
     /**
      * Stops all registered services.
      */
     public stopAllServices(): void {
-        for (const service of this.services.values()) {
-            service.stopService();
+        for (const name of this.services.keys()) {
+            this.stopService(name);
         }
     }
 
@@ -359,15 +349,19 @@ export class MicroServiceManager {
      * Get a list of the statuses of all registered services.
      * @returns A list of the service statuses
      */
-    public listServiceStatuses(): { name: string; status: string }[] {
-        // Loop through all services and get their statuses
-        const statuses: { name: string; status: string }[] = [];
-        for (const [name, service] of this.services.entries()) {
-            statuses.push({ name, status: service.status });
+    public listServicesInTable(): void {
+        // Make a table
+        const table = [];
+        for (const [name, [service, _path]] of this.services.entries()) {
+            table.push({ 
+                name: name, 
+                status: service.status, 
+                uptime: this.formatDuration(service.getTotalUptime()), 
+                downtime: this.formatDuration(service.getDowntime()), 
+                timeSinceLoad: this.formatDuration(service.getTotalTime())
+            });
         }
-
-        // Return the list of statuses
-        return statuses;
+        console.table(table);
     }
 
     /**
