@@ -87,7 +87,7 @@ export abstract class Service {
      */
     private setStatus(status: ServiceStatus): void {
         this.status = status;
-        console.log(`\x1b[33m[${new Date().toISOString()}] [STATUS] [${this.name}] Changed to ${status}.\x1b[0m`);
+        console.warn(`\x1b[STATUS] Changed to ${status}.\x1b[0m`);
     }
 
     /**
@@ -108,7 +108,7 @@ export abstract class Service {
 
         // Catch any errors that occur during startup
         } catch (error) {
-            console.error(`\x1b[32m[${new Date().toISOString()}] [ERROR] [${this.name}] Failed to start: ${error}\x1b[0m`);
+            console.error(`\x1b[32m[ERROR] Failed to start: ${error}\x1b[0m`);
             this.setStatus(ServiceStatus.FAILED_TO_START);
             return;
         }
@@ -116,7 +116,7 @@ export abstract class Service {
         // Start the service
         this.setStatus(ServiceStatus.RUNNING);
         this.startTime = new Date();
-        console.log(`\x1b[34m[${new Date().toISOString()}] [INFO] [${this.name}] Started successfully.\x1b[0m`);
+        console.log(`\x1b[34m[INFO] Started successfully.\x1b[0m`);
     }
 
     /**
@@ -138,7 +138,7 @@ export abstract class Service {
         // Catch any errors that occur during shutdown
         } catch (error) {
             this.setStatus(ServiceStatus.FAILED_TO_STOP);
-            console.error(`\x1b[32m[${new Date().toISOString()}] [ERROR] [${this.name}] Failed to stop: ${error}\x1b[0m`);
+            console.error(`\x1b[32m[ERROR] Failed to stop: ${error}\x1b[0m`);
             return;
         }
 
@@ -147,7 +147,7 @@ export abstract class Service {
 
         // Add the uptime entry to the history
         this.timeHistory.push({ start: this.startTime!, stop: new Date() });
-        console.log(`\x1b[34m[${new Date().toISOString()}] [INFO] [${this.name}] Stopped successfully.\x1b[0m`);
+        console.log(`\x1b[34m[INFO] Stopped successfully.\x1b[0m`);
     }
 
     // ---- Abstract methods to be implemented by subclasses ----
