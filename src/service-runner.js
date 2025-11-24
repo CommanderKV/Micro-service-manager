@@ -47,19 +47,58 @@ async function run() {
 			} catch (e) {}
 		}
 
-		// Listen for stop message and status requests
+		// Listen for control messages. Use a shutdownPromise to keep the runner alive until an
+		// explicit `shutdown` is requested. `stop` will only stop the service but keep the
+		// process alive; `start` can restart it; `shutdown` will stop and then allow exit.
+		let shutdownResolve;
+		const shutdownPromise = new Promise((res) => { shutdownResolve = res; });
+
+		process.stdin && process.stdin.resume && process.stdin.resume();
+
 		process.on("message", (msg) => {
 			if (!msg || !msg.type) return;
+
+			// Graceful stop: stop the service but DO NOT exit the process
 			if (msg.type === "stop") {
-				if (svcInstance && typeof svcInstance.stopService === "function") {
-					try {
-						svcInstance.stopService();
-					} catch (e) {
-						console.error("[service-runner] Error during stopService:", e);
+				(async () => {
+					if (svcInstance && typeof svcInstance.stopService === "function") {
+						try {
+							await svcInstance.stopService();
+						} catch (e) {
+							console.error("[service-runner] Error during stopService:", e);
+						}
 					}
-				}
-				// Exit after attempting to stop
-				process.exit(0);
+				})();
+				return;
+			}
+
+			// Start the service again if needed
+			if (msg.type === "start") {
+				(async () => {
+					if (svcInstance && typeof svcInstance.startService === "function") {
+						try {
+							await svcInstance.startService();
+						} catch (e) {
+							console.error("[service-runner] Error during startService:", e);
+						}
+					}
+				})();
+				return;
+			}
+
+			// Final shutdown: stop service and allow the process to exit
+			if (msg.type === "shutdown" || msg.type === "exit") {
+				(async () => {
+					if (svcInstance && typeof svcInstance.stopService === "function") {
+						try {
+							await svcInstance.stopService();
+						} catch (e) {
+							console.error("[service-runner] Error during stopService:", e);
+						}
+					}
+					try { shutdownResolve(); } catch (e) { }
+				})();
+				return;
 			}
 
 			if (msg.type === "getStatus") {
@@ -72,7 +111,7 @@ async function run() {
 				};
 				try {
 					process.send({ type: "statusResponse", id: msg.id, payload });
-				} catch (e) {}
+				} catch (e) { }
 			}
 		});
 
@@ -95,12 +134,17 @@ async function run() {
 		});
 
 		// Start the service
-		if (svcInstance && typeof svcInstance.startService === "function") {
+		if (svcInstance && typeof svcInstance.startService === 'function') {
 			await svcInstance.startService();
 		} else {
-			console.error("[service-runner] Service does not implement startService()");
+			console.error('[service-runner] Service does not implement startService()');
+			try { stopResolve(); } catch (e) { }
 			process.exit(1);
 		}
+
+		// Wait until shutdown is requested. This keeps the process alive across `stop` calls.
+		await shutdownPromise;
+		process.exit(0);
 	} catch (err) {
 		console.error("[service-runner] Failed to run service:", err);
 		process.exit(1);
