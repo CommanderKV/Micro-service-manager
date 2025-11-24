@@ -3,9 +3,10 @@ import readline from "readline";
 import fs from "fs";
 import path from "path";
 import { pathToFileURL } from "url";
+import { fork, ChildProcess } from "child_process";
 
 export class MicroServiceManager {
-    private services: Map<string, [Service, string]> = new Map();
+    private services: Map<string, { service: Service; path: string; child?: ChildProcess; startedAt?: number }> = new Map();
     private servicesDirectory: string;
 
     constructor(servicesDirectory: string) {
@@ -227,14 +228,17 @@ export class MicroServiceManager {
      * @param path The path to the service
      */
     public loadService(path: string): void {
-        const filePath = pathToFileURL(path).href;
+        const fileUrl = pathToFileURL(path).href;
+
         // Dynamically import the service module
-        import(filePath).then((module) => {
-            // Create an instance of the service
+        import(fileUrl).then((module) => {
+            // Create an instance of the service (for metadata only)
             const serviceInstance: Service = new module.default();
-            this.addService(serviceInstance, filePath);
+            
+            // Store the filesystem path so runners can `import()` it in child processes
+            this.addService(serviceInstance, path);
         }).catch((error) => {
-            console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] Failed to load service from ${filePath}: ${error}\x1b[0m`);
+            console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] Failed to load service from ${fileUrl}: ${error}\x1b[0m`);
         });
     }
 
@@ -253,7 +257,7 @@ export class MicroServiceManager {
         }
 
         // Register the service
-        this.services.set(name, [service, path]);
+        this.services.set(name, { service, path });
         console.log(`\x1b[32m[${new Date().toISOString()}] [INFO] Service ${name} registered successfully.\x1b[0m`);
     }
 
@@ -263,12 +267,12 @@ export class MicroServiceManager {
      * @returns The service if found, otherwise undefined
      */
     public getService(name: string): Service | undefined {
-        const service = this.services.get(name);
-        if (!service) {
+        const entry = this.services.get(name);
+        if (!entry) {
             console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] Service '${name}' is not registered.\x1b[0m`);
             return undefined;
         }
-        return service[0];
+        return entry.service;
     }
 
     /**
@@ -282,6 +286,16 @@ export class MicroServiceManager {
             return;
         }
 
+        const entry = this.services.get(name);
+        // If there's a running child process, ensure it's killed
+        if (entry && entry.child) {
+            try {
+                entry.child.kill();
+            } catch (e) {
+                // ignore
+            }
+        }
+
         // Unregister the service
         this.services.delete(name);
         console.log(`\x1b[32m[${new Date().toISOString()}] [INFO] Service ${name} unregistered successfully.\x1b[0m`);
@@ -292,15 +306,72 @@ export class MicroServiceManager {
      * @param name The name of the service to start
      */
     public startService(name: string): void {
-        // Make sure the service is registered
-        const service = this.services.get(name);
-        if (!service) {
+        const entry = this.services.get(name);
+        if (!entry) {
             console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] Service '${name}' is not registered.\x1b[0m`);
             return;
         }
 
-        // Start the service
-        service[0].startService();
+        // If already running in a child, ignore
+        if (entry.child) {
+            console.log(`\x1b[33m[${new Date().toISOString()}] [WARN] Service '${name}' already has a running child process.\x1b[0m`);
+            return;
+        }
+
+        // Fork a child process that will run the service to allow independent lifecycle control.
+        // In ESM `__dirname` is not defined, so use `process.cwd()` to reference the project files.
+        const runnerPath = path.join(process.cwd(), "src", "service-runner.js");
+        const child = fork(runnerPath, [entry.path], {
+            cwd: process.cwd(),
+            env: process.env,
+            stdio: ["inherit", "pipe", "pipe", "ipc"]
+        });
+
+        // Forward child's stdout/stderr to main process but prefix with service name and timestamp
+        if (child.stdout) {
+            child.stdout.on("data", (chunk: Buffer) => {
+                const lines = chunk.toString().split(/\r?\n/).filter(Boolean);
+                for (const line of lines) {
+                    console.log(`\x1b[36m[${new Date().toISOString()}] [${name}] ${line}\x1b[0m`);
+                }
+            });
+        }
+        if (child.stderr) {
+            child.stderr.on("data", (chunk: Buffer) => {
+                const lines = chunk.toString().split(/\r?\n/).filter(Boolean);
+                for (const line of lines) {
+                    console.error(`\x1b[31m[${new Date().toISOString()}] [${name}] ${line}\x1b[0m`);
+                }
+            });
+        }
+
+        // Also listen for IPC messages for structured logs
+        child.on("message", (msg: any) => {
+            if (msg && msg.type === "log") {
+                // Get the level
+                const level = msg.level || "info";
+
+                // Set the output
+                const out = `[${new Date().toISOString()}] [${name}] ${msg.message}`;
+                if (level === "error") console.error(`\x1b[31m${out}\x1b[0m`);
+                else if (level === "warn") console.warn(`\x1b[33m${out}\x1b[0m`);
+                else console.log(`\x1b[36m${out}\x1b[0m`);
+            }
+        });
+
+        child.on("exit", (code, signal) => {
+            console.log(`\x1b[33m[${new Date().toISOString()}] [INFO] Service '${name}' child exited with code=${code} signal=${signal}\x1b[0m`);
+            // Clear reference and startedAt
+            const current = this.services.get(name);
+            if (current) {
+                current.child = undefined;
+                current.startedAt = undefined;
+            }
+        });
+
+        // Store child reference and mark start time for uptime calculations
+        entry.child = child;
+        entry.startedAt = Date.now();
     }
 
     /**
@@ -317,15 +388,33 @@ export class MicroServiceManager {
      * @param name The name of the service to stop.
      */
     public stopService(name: string): void {
-        // Make sure the service is registered
-        const service = this.services.get(name);
-        if (!service) {
+        const entry = this.services.get(name);
+        if (!entry) {
             console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] Service '${name}' is not registered.\x1b[0m`);
             return;
         }
 
-        // Stop the service
-        service[0].stopService();
+        // If service is running in a child process, request graceful stop then kill if needed
+        if (entry.child) {
+            try {
+                // Ask child to stop gracefully
+                entry.child.send({ type: "stop" });
+                // Give it a short grace period
+                setTimeout(() => {
+                    try {
+                        entry.child && entry.child.kill();
+                    } catch (e) {
+                        // ignore
+                    }
+                }, 3000);
+            } catch (e) {
+                try { entry.child.kill(); } catch (er) { }
+            }
+            return;
+        }
+
+        // Fallback to in-process stop
+        entry.service.stopService();
     }
 
     /**
@@ -352,13 +441,19 @@ export class MicroServiceManager {
     public listServicesInTable(): void {
         // Make a table
         const table = [];
-        for (const [name, [service, _path]] of this.services.entries()) {
+        for (const [name, entry] of this.services.entries()) {
+            const service = entry.service;
+            // If service is running in a child process, reflect that status and compute uptime from startedAt
+            const status = entry.child ? "running" : service.status;
+            const uptimeMs = entry.startedAt ? (Date.now() - entry.startedAt) : service.getTotalUptime();
+            const downtimeMs = entry.startedAt ? 0 : service.getDowntime();
+            const timeSinceLoadMs = service.getTotalTime();
             table.push({ 
                 name: name, 
-                status: service.status, 
-                uptime: this.formatDuration(service.getTotalUptime()), 
-                downtime: this.formatDuration(service.getDowntime()), 
-                timeSinceLoad: this.formatDuration(service.getTotalTime())
+                status: status, 
+                uptime: this.formatDuration(uptimeMs), 
+                downtime: this.formatDuration(downtimeMs), 
+                timeSinceLoad: this.formatDuration(timeSinceLoadMs)
             });
         }
         console.table(table);
