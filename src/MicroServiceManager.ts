@@ -8,8 +8,14 @@ import { fork, ChildProcess } from "child_process";
 export class MicroServiceManager {
     private services: Map<string, { service: Service; path: string; child?: ChildProcess; startedAt?: number }> = new Map();
     private servicesDirectory: string;
+    private defaultGracefulShutdownMs: number = 3000;
 
-    constructor(servicesDirectory: string) {
+    /**
+     * The constructor for the MicroServiceManager.
+     * @param servicesDirectory The directory that holds the services
+     * @param defaultGracefulShutdownMs The time in ms that the service has to shutdown before being killed
+     */
+    constructor(servicesDirectory: string, defaultGracefulShutdownMs?: number) {
         if (!servicesDirectory.endsWith("/")) {
             servicesDirectory += "/";
         }
@@ -29,6 +35,10 @@ export class MicroServiceManager {
             }
         } else {
             this.servicesDirectory = path.join(process.cwd(), servicesDirectory);
+        }
+
+        if (defaultGracefulShutdownMs !== undefined) {
+            this.defaultGracefulShutdownMs = defaultGracefulShutdownMs;
         }
     }
 
@@ -234,7 +244,7 @@ export class MicroServiceManager {
         import(fileUrl).then((module) => {
             // Create an instance of the service (for metadata only)
             const serviceInstance: Service = new module.default();
-            
+
             // Store the filesystem path so runners can `import()` it in child processes
             this.addService(serviceInstance, path);
         }).catch((error) => {
@@ -287,12 +297,13 @@ export class MicroServiceManager {
         }
 
         const entry = this.services.get(name);
-        // If there's a running child process, ensure it's killed
+        // If there's a running child process stop it then remove it
         if (entry && entry.child) {
             try {
+                this.stopService(name);
                 entry.child.kill();
             } catch (e) {
-                // ignore
+                console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] Failed to stop child process for service ${name}: ${e}\x1b[0m`);
             }
         }
 
@@ -314,13 +325,18 @@ export class MicroServiceManager {
 
         // If already running in a child, ignore
         if (entry.child) {
-            console.log(`\x1b[33m[${new Date().toISOString()}] [WARN] Service '${name}' already has a running child process.\x1b[0m`);
+            console.warn(`\x1b[33m[${new Date().toISOString()}] [WARN] Service '${name}' already has a running child process.\x1b[0m`);
             return;
         }
 
-        // Fork a child process that will run the service to allow independent lifecycle control.
-        // In ESM `__dirname` is not defined, so use `process.cwd()` to reference the project files.
+        // Check if the runner is available
         const runnerPath = path.join(process.cwd(), "src", "service-runner.js");
+        if (!fs.existsSync(runnerPath)) {
+            console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] Service runner not found at path: ${runnerPath}\x1b[0m`);
+            return;
+        }
+
+        // Fork(Start a new thread) a new child process to run the service
         const child = fork(runnerPath, [entry.path], {
             cwd: process.cwd(),
             env: process.env,
@@ -399,6 +415,7 @@ export class MicroServiceManager {
             try {
                 // Ask child to stop gracefully
                 entry.child.send({ type: "stop" });
+
                 // Give it a short grace period
                 setTimeout(() => {
                     try {
@@ -406,7 +423,7 @@ export class MicroServiceManager {
                     } catch (e) {
                         // ignore
                     }
-                }, 3000);
+                }, this.defaultGracefulShutdownMs);
             } catch (e) {
                 try { entry.child.kill(); } catch (er) { }
             }
@@ -443,8 +460,9 @@ export class MicroServiceManager {
         const table = [];
         for (const [name, entry] of this.services.entries()) {
             const service = entry.service;
+
             // If service is running in a child process, reflect that status and compute uptime from startedAt
-            const status = entry.child ? "running" : service.status;
+            const status = service.status;
             const uptimeMs = entry.startedAt ? (Date.now() - entry.startedAt) : service.getTotalUptime();
             const downtimeMs = entry.startedAt ? 0 : service.getDowntime();
             const timeSinceLoadMs = service.getTotalTime();
