@@ -6,7 +6,8 @@ import { pathToFileURL } from "url";
 import { fork, ChildProcess } from "child_process";
 
 export class MicroServiceManager {
-    private services: Map<string, { service: Service; path: string; child?: ChildProcess; startedAt?: number }> = new Map();
+    private services: Map<string, { path: string; child?: ChildProcess; startedAt?: number; registeredName?: string }> = new Map();
+    private pendingRequests: Map<string, (payload: any) => void> = new Map();
     private servicesDirectory: string;
     private defaultGracefulShutdownMs: number = 3000;
 
@@ -102,10 +103,13 @@ export class MicroServiceManager {
                         }
 
                         // Get the service status
-                        const service = this.getService(serviceName);
-                        if (service) {
-                            console.log(`\x1b[32mService ${serviceName} status: ${service.status}\x1b[0m`);
-                        }
+                            this.getServiceStatus(serviceName).then((status) => {
+                                if (status) {
+                                    console.log(`\x1b[32mService ${serviceName} status: ${status.status} uptime=${this.formatDuration(status.uptime)}\x1b[0m`);
+                                }
+                            }).catch((err) => {
+                                console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] ${err}\x1b[0m`);
+                            });
                         break;
                     
                     // Give a list of all registered services and their details
@@ -238,51 +242,72 @@ export class MicroServiceManager {
      * @param path The path to the service
      */
     public loadService(path: string): void {
-        const fileUrl = pathToFileURL(path).href;
-
-        // Dynamically import the service module
-        import(fileUrl).then((module) => {
-            // Create an instance of the service (for metadata only)
-            const serviceInstance: Service = new module.default();
-
-            // Store the filesystem path so runners can `import()` it in child processes
-            this.addService(serviceInstance, path);
-        }).catch((error) => {
-            console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] Failed to load service from ${fileUrl}: ${error}\x1b[0m`);
-        });
-    }
-
-    /**
-     * Add a new microservice to the manager.
-     * @param service The service to add
-     */
-    public addService(service: Service, path: string): void | Error {
-        // Get the service name
-        const name = service.name;
-
-        // Check if the service is already registered
-        if (this.services.has(name)) {
-            console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] Service with name ${name} is already registered.\x1b[0m`);
+        // Do not instantiate the service in-process. Just register the path.
+        if (!fs.existsSync(path)) {
+            console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] Service file does not exist: ${path}\x1b[0m`);
             return;
         }
 
-        // Register the service
-        this.services.set(name, { service, path });
-        console.log(`\x1b[32m[${new Date().toISOString()}] [INFO] Service ${name} registered successfully.\x1b[0m`);
+        // Use the filename (without extension) as the temporary key until the child registers its real name
+        const base = path.split(/[\\\/]/).pop() || path;
+        const key = base.replace(/\.js$|\.ts$/i, "");
+        this.services.set(key, { path });
+        console.log(`\x1b[32m[${new Date().toISOString()}] [INFO] Service at ${path} registered as '${key}'.\x1b[0m`);
     }
 
     /**
-     * Get a registered service by name.
-     * @param name The name of the service
-     * @returns The service if found, otherwise undefined
+     * Query the running service for status. Returns a promise that resolves with status payload
+     * or rejects if service not found or not running.
      */
-    public getService(name: string): Service | undefined {
-        const entry = this.services.get(name);
-        if (!entry) {
-            console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] Service '${name}' is not registered.\x1b[0m`);
-            return undefined;
+    public getServiceStatus(name: string, timeoutMs = 2000): Promise<{ name: string; status: string; uptime: number; downtime: number; timeSinceLoad: number } | null> {
+        return new Promise((resolve, reject) => {
+            // Find entry by key, registeredName or by path basename
+            const entryKey = this.findEntryKey(name);
+            if (!entryKey) {
+                return reject(`Service '${name}' is not registered.`);
+            }
+            const entry = this.services.get(entryKey)!;
+
+            if (!entry.child) {
+                // Not running
+                return resolve(null);
+            }
+
+            // Send request with unique id
+            const id = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+            this.pendingRequests.set(id, (payload) => {
+                this.pendingRequests.delete(id);
+                resolve(payload);
+            });
+
+            try {
+                entry.child!.send({ type: "getStatus", id });
+            } catch (e) {
+                this.pendingRequests.delete(id);
+                return reject(e);
+            }
+
+            // Timeout
+            setTimeout(() => {
+                if (this.pendingRequests.has(id)) {
+                    this.pendingRequests.delete(id);
+                    return reject(`Timeout waiting for status from service '${name}'.`);
+                }
+            }, timeoutMs);
+        });
+    }
+
+    private findEntryKey(nameOrPath: string): string | undefined {
+        // Exact key
+        if (this.services.has(nameOrPath)) return nameOrPath;
+        // Match registeredName
+        for (const [k, v] of this.services.entries()) {
+            if (v.registeredName === nameOrPath) return k;
+            if (v.path.endsWith(nameOrPath)) return k;
+            const base = v.path.split(/[\\\/]/).pop() || v.path;
+            if (base.replace(/\.js$|\.ts$/i, "") === nameOrPath) return k;
         }
-        return entry.service;
+        return undefined;
     }
 
     /**
@@ -317,11 +342,12 @@ export class MicroServiceManager {
      * @param name The name of the service to start
      */
     public startService(name: string): void {
-        const entry = this.services.get(name);
-        if (!entry) {
+        const entryKey = this.findEntryKey(name);
+        if (!entryKey) {
             console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] Service '${name}' is not registered.\x1b[0m`);
             return;
         }
+        const entry = this.services.get(entryKey)!;
 
         // If already running in a child, ignore
         if (entry.child) {
@@ -336,8 +362,22 @@ export class MicroServiceManager {
             return;
         }
 
+        // Determine runtime path for the service: prefer compiled `dist` JS if a `.ts` source was registered
+        let runPath = entry.path;
+        if (runPath.endsWith('.ts')) {
+            // Try to map a source `src/.../X.ts` to `dist/.../X.js` by replacing 'src' with 'dist'
+            const parts = runPath.split(path.sep);
+            const srcIdx = parts.indexOf('src');
+            if (srcIdx !== -1) {
+                const partsCopy = parts.slice();
+                partsCopy[srcIdx] = 'dist';
+                const distPath = path.join(...partsCopy).replace(/\.ts$/i, '.js');
+                if (fs.existsSync(distPath)) runPath = distPath;
+            }
+        }
+
         // Fork(Start a new thread) a new child process to run the service
-        const child = fork(runnerPath, [entry.path], {
+        const child = fork(runnerPath, [runPath], {
             cwd: process.cwd(),
             env: process.env,
             stdio: ["inherit", "pipe", "pipe", "ipc"]
@@ -361,27 +401,58 @@ export class MicroServiceManager {
             });
         }
 
-        // Also listen for IPC messages for structured logs
+        // Also listen for IPC messages for structured logs and control messages
         child.on("message", (msg: any) => {
-            if (msg && msg.type === "log") {
-                // Get the level
+            if (!msg || !msg.type) return;
+            if (msg.type === "log") {
                 const level = msg.level || "info";
-
-                // Set the output
-                const out = `[${new Date().toISOString()}] [${name}] ${msg.message}`;
+                const out = `[${new Date().toISOString()}] [${entry.registeredName ?? name}] ${msg.message}`;
                 if (level === "error") console.error(`\x1b[31m${out}\x1b[0m`);
                 else if (level === "warn") console.warn(`\x1b[33m${out}\x1b[0m`);
                 else console.log(`\x1b[36m${out}\x1b[0m`);
+                return;
+            }
+
+            if (msg.type === "register") {
+                // Child reports its real name. Move the entry key to the registered name for easier reference.
+                const realName: string = msg.name;
+                // Avoid clobbering an existing registered service name
+                if (this.services.has(realName)) {
+                    console.warn(`\x1b[33m[${new Date().toISOString()}] [WARN] Service name '${realName}' already exists; keeping original key.\x1b[0m`);
+                } else {
+                    // Re-key the map: copy entry to new key, delete old
+                    this.services.set(realName, entry);
+                    this.services.delete(entryKey);
+                    entry.registeredName = realName;
+                    // Update local variable `name` for logging below
+                }
+                return;
+            }
+
+            if (msg.type === "statusResponse") {
+                const id = msg.id;
+                const cb = this.pendingRequests.get(id);
+                if (cb) cb(msg.payload);
+                return;
             }
         });
 
         child.on("exit", (code, signal) => {
-            console.log(`\x1b[33m[${new Date().toISOString()}] [INFO] Service '${name}' child exited with code=${code} signal=${signal}\x1b[0m`);
-            // Clear reference and startedAt
-            const current = this.services.get(name);
-            if (current) {
-                current.child = undefined;
-                current.startedAt = undefined;
+            if (code === null && signal === null) {
+                console.log(`\x1b[34m[${new Date().toISOString()}] [INFO] Service child exited normally.\x1b[0m`);
+            } else if (signal === null) {
+                console.log(`\x1b[34m[${new Date().toISOString()}] [INFO] Service child exited forcibly with code: ${code}.\x1b[0m`);
+            } else {
+                console.log(`\x1b[34m[${new Date().toISOString()}] [INFO] Service child exited with code: ${code}, signal: ${signal}\x1b[0m`);
+            }
+
+            // Clear reference and startedAt for the matching entry
+            for (const [k, v] of this.services.entries()) {
+                if (v.child === child) {
+                    v.child = undefined;
+                    v.startedAt = undefined;
+                    break;
+                }
             }
         });
 
@@ -404,11 +475,12 @@ export class MicroServiceManager {
      * @param name The name of the service to stop.
      */
     public stopService(name: string): void {
-        const entry = this.services.get(name);
-        if (!entry) {
+        const entryKey = this.findEntryKey(name);
+        if (!entryKey) {
             console.error(`\x1b[31m[${new Date().toISOString()}] [ERROR] Service '${name}' is not registered.\x1b[0m`);
             return;
         }
+        const entry = this.services.get(entryKey)!;
 
         // If service is running in a child process, request graceful stop then kill if needed
         if (entry.child) {
@@ -430,8 +502,8 @@ export class MicroServiceManager {
             return;
         }
 
-        // Fallback to in-process stop
-        entry.service.stopService();
+        // No in-process instance is kept by manager; if not running in a child, nothing to stop
+        console.warn(`\x1b[33m[${new Date().toISOString()}] [WARN] Service '${name}' is not running in a child process; nothing to stop.\x1b[0m`);
     }
 
     /**
@@ -459,15 +531,13 @@ export class MicroServiceManager {
         // Make a table
         const table = [];
         for (const [name, entry] of this.services.entries()) {
-            const service = entry.service;
-
             // If service is running in a child process, reflect that status and compute uptime from startedAt
-            const status = service.status;
-            const uptimeMs = entry.startedAt ? (Date.now() - entry.startedAt) : service.getTotalUptime();
-            const downtimeMs = entry.startedAt ? 0 : service.getDowntime();
-            const timeSinceLoadMs = service.getTotalTime();
+            const status = entry.child ? "running" : "stopped";
+            const uptimeMs = entry.startedAt ? (Date.now() - entry.startedAt) : 0;
+            const downtimeMs = entry.startedAt ? 0 : 0; // downtime not tracked for child-run services here
+            const timeSinceLoadMs = 0; // manager no longer has load timestamps per-service
             table.push({ 
-                name: name, 
+                name: entry.registeredName ?? name, 
                 status: status, 
                 uptime: this.formatDuration(uptimeMs), 
                 downtime: this.formatDuration(downtimeMs), 

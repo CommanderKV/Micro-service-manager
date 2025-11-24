@@ -14,7 +14,7 @@ enum ServiceStatus {
 export abstract class Service {
     public name: string;
     public status: ServiceStatus = ServiceStatus.STOPPED;
-    private createdAt: Date = new Date();
+    private createdAt: Date;
     private startTime: Date | null = null;
     private timeHistory: Array<{ start: Date; stop: Date }> = [];
 
@@ -24,6 +24,7 @@ export abstract class Service {
      */
     constructor(name: string) {
         this.name = name;
+        this.createdAt = new Date();
     }
 
     /**
@@ -87,7 +88,7 @@ export abstract class Service {
      */
     private setStatus(status: ServiceStatus): void {
         this.status = status;
-        console.warn(`\x1b[STATUS] Changed to ${status}.\x1b[0m`);
+        console.warn(`\x1b[33m[STATUS] Changed to ${status}.\x1b[0m`);
     }
 
     /**
@@ -116,7 +117,7 @@ export abstract class Service {
         // Start the service
         this.setStatus(ServiceStatus.RUNNING);
         this.startTime = new Date();
-        console.log(`\x1b[34m[INFO] Started successfully.\x1b[0m`);
+        console.log(`\x1b[32m[INFO] Started successfully.\x1b[0m`);
     }
 
     /**
@@ -147,7 +148,7 @@ export abstract class Service {
 
         // Add the uptime entry to the history
         this.timeHistory.push({ start: this.startTime!, stop: new Date() });
-        console.log(`\x1b[34m[INFO] Stopped successfully.\x1b[0m`);
+        console.log(`\x1b[32m[INFO] Stopped successfully.\x1b[0m`);
     }
 
     // ---- Abstract methods to be implemented by subclasses ----

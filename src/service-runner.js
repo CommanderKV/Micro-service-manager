@@ -40,9 +40,17 @@ async function run() {
 		const ServiceClass = mod.default;
 		svcInstance = new ServiceClass();
 
-		// Listen for stop message
+		// Notify manager of the real service name so manager need not instantiate the service itself
+		if (process.send) {
+			try {
+				process.send({ type: "register", name: svcInstance.name });
+			} catch (e) {}
+		}
+
+		// Listen for stop message and status requests
 		process.on("message", (msg) => {
-			if (msg && msg.type === "stop") {
+			if (!msg || !msg.type) return;
+			if (msg.type === "stop") {
 				if (svcInstance && typeof svcInstance.stopService === "function") {
 					try {
 						svcInstance.stopService();
@@ -50,9 +58,21 @@ async function run() {
 						console.error("[service-runner] Error during stopService:", e);
 					}
 				}
-
 				// Exit after attempting to stop
 				process.exit(0);
+			}
+
+			if (msg.type === "getStatus") {
+				const payload = {
+					name: svcInstance?.name,
+					status: svcInstance?.status,
+					uptime: typeof svcInstance?.getTotalUptime === "function" ? svcInstance.getTotalUptime() : 0,
+					downtime: typeof svcInstance?.getDowntime === "function" ? svcInstance.getDowntime() : 0,
+					timeSinceLoad: typeof svcInstance?.getTotalTime === "function" ? svcInstance.getTotalTime() : 0,
+				};
+				try {
+					process.send({ type: "statusResponse", id: msg.id, payload });
+				} catch (e) {}
 			}
 		});
 
